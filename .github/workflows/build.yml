@@ -25,62 +25,58 @@ jobs:
           token: ${{ secrets.EXPO_TOKEN }}
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci --ignore-scripts
 
       - name: Expo Prebuild (Android)
-        run: npx expo prebuild --platform android --no-install
+        run: npx expo prebuild --platform android
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
-      - name: Install missing deps after prebuild
-        run: npm install expo-asset
-
-      - name: Fix Kotlin version compatibility (comprehensive)
+      - name: Fix Kotlin version compatibility
         run: |
-          echo "=== Before fix ==="
-          grep -in "kotlin" android/build.gradle | head -10
-          grep -in "kotlin" android/gradle.properties 2>/dev/null || echo "No gradle.properties kotlin entry"
+          # Fix Compose Compiler 1.5.15 / Kotlin version mismatch
+          # Force Kotlin Gradle plugin to 1.9.25 via gradle.properties
+          cd android
+          echo "Before fix:"
+          grep -in "kotlin" build.gradle | head -10
+          cat gradle.properties | grep -i kotlin || echo "(no kotlin props)"
           
-          # 1. Fix build.gradle kotlinVersion property
-          sed -i 's/kotlinVersion = "1.9.24"/kotlinVersion = "1.9.25"/g' android/build.gradle || true
-          sed -i "s/kotlinVersion = findProperty('android.kotlinVersion') ?: '1.9.24'/kotlinVersion = findProperty('android.kotlinVersion') ?: '1.9.25'/g" android/build.gradle || true
+          # Set kotlin version via gradle.properties (findProperty reads from here)
+          echo "android.kotlinVersion=1.9.25" >> gradle.properties
           
-          # 2. Force Kotlin Gradle Plugin version in buildscript
-          sed -i "s/classpath('org.jetbrains.kotlin:kotlin-gradle-plugin')/classpath('org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25')/g" android/build.gradle || true
-          sed -i 's/classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")/classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25")/g' android/build.gradle || true
+          # Force kotlin-gradle-plugin version in buildscript
+          # Replace the unversioned kotlin-gradle-plugin with explicit version
+          sed -i "s|classpath('org.jetbrains.kotlin:kotlin-gradle-plugin')|classpath('org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25')|g" build.gradle
           
-          # 3. Add to gradle.properties if not exists
-          if ! grep -q "^kotlin=" android/gradle.properties 2>/dev/null; then
-            echo "kotlin=1.9.25" >> android/gradle.properties
-          else
-            sed -i 's/^kotlin=.*/kotlin=1.9.25/' android/gradle.properties
-          fi
-          
-          # 4. Add suppress flag as fallback
-          if ! grep -q "suppressKotlinVersionCompatibilityCheck" android/gradle.properties 2>/dev/null; then
-            echo "suppressKotlinVersionCompatibilityCheck=true" >> android/gradle.properties
-          fi
-          
-          echo "=== After fix ==="
-          grep -in "kotlin" android/build.gradle | head -10
-          grep -in "kotlin" android/gradle.properties || echo "No kotlin in gradle.properties"
-          cat android/gradle.properties | tail -5
+          echo ""
+          echo "After fix:"
+          grep -in "kotlin" build.gradle | head -10
+          echo "---"
+          grep -i kotlin gradle.properties
 
-      - name: Build APK with Gradle
+      - name: Build APK
         run: |
           cd android
+          chmod +x gradlew
           ./gradlew assembleRelease --no-daemon
+        env:
+          EXPO_PUBLIC_SUPABASE_URL: ${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}
+          EXPO_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}
+          EXPO_PUBLIC_OPENAI_API_KEY: ${{ secrets.EXPO_PUBLIC_OPENAI_API_KEY }}
+          EXPO_PUBLIC_ELEVENLABS_API_KEY: ${{ secrets.EXPO_PUBLIC_ELEVENLABS_API_KEY }}
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: coze-app-android
-          path: "android/app/build/outputs/apk/release/*.apk"
-          retention-days: 30
+          path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: warn
+          retention-days: 30
 
   build-ios:
-    name: Build iOS IPA
-    runs-on: macos-14
+    name: Build iOS IPA (EAS)
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -90,60 +86,93 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Setup Expo and EAS
+        uses: expo/expo-github-action@v8
+        with:
+          expo-version: latest
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
       - name: Install dependencies
-        run: npm install
+        run: npm ci --ignore-scripts
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.2.app
-
-      - name: Install CocoaPods
-        run: sudo gem install cocoapods
-
-      - name: Prebuild Expo (iOS)
-        run: npx expo prebuild --platform ios
-
-      - name: Install Pods
+      - name: Build IPA with EAS
         run: |
-          cd ios
-          pod install
-          cd ..
+          # Initialize EAS project if not already configured
+          eas init --non-interactive || true
+          
+          # Build with EAS
+          eas build --platform ios --profile preview --non-interactive --no-wait 2>&1 | tee eas-build.log
+          
+          # Extract build URL if available
+          grep -oP 'https://expo\.dev/accounts/[^\s]+' eas-build.log || true
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
-      - name: Build Unsigned IPA
+      - name: Wait for EAS build and download
         run: |
-          # Fix: use find to correctly detect .xcodeproj directory
-          PROJECT_DIR=$(find ios -maxdepth 1 -name "*.xcodeproj" -type d | head -1)
-          PROJECT_NAME=$(basename "$PROJECT_DIR" .xcodeproj)
-          WORKSPACE="${PROJECT_NAME}.xcworkspace"
+          echo "Waiting for EAS iOS build to complete..."
+          for i in $(seq 1 60); do
+            sleep 30
+            echo "Polling attempt $i..."
+            
+            BUILD_JSON=$(eas build:list --platform ios --limit 1 --json 2>/dev/null || echo "[]")
+            
+            STATUS=$(echo "$BUILD_JSON" | python3 -c "
+          import json,sys
+          try:
+            d=json.load(sys.stdin)
+            if d and len(d)>0:
+              s = d[0].get('status','unknown')
+              print(s)
+            else:
+              print('no_build')
+          except:
+            print('parse_error')
+          " 2>/dev/null || echo "error")
+            
+            echo "Status: $STATUS"
+            
+            if [ "$STATUS" = "FINISHED" ]; then
+              ARTIFACT_URL=$(echo "$BUILD_JSON" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          print(d[0].get('artifacts',{}).get('applicationArchiveUrl',''))
+          " 2>/dev/null || echo "")
+              
+              echo "Downloading artifact from: $ARTIFACT_URL"
+              if [ -n "$ARTIFACT_URL" ]; then
+                curl -L -o coze-app.ipa "$ARTIFACT_URL"
+                echo "Download complete!"
+                ls -la *.ipa
+              fi
+              break
+            elif [ "$STATUS" = "ERRORED" ] || [ "$STATUS" = "error" ] || [ "$STATUS" = "CANCELED" ]; then
+              echo "EAS build failed with status: $STATUS"
+              echo "Build details:"
+              echo "$BUILD_JSON" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          if d and len(d)>0:
+            b = d[0]
+            print(f\"  Platform: {b.get('platform','?')}\")
+            print(f\"  Status: {b.get('status','?')}\")
+            print(f\"  Error: {b.get('error',{}).get('message','N/A') if isinstance(b.get('error'), dict) else b.get('error','N/A')}\")
+            print(f\"  Created: {b.get('createdAt','?')}\")
+          " 2>/dev/null || echo "Could not parse build details"
+              exit 1
+            fi
+          done
           
-          echo "Project dir: $PROJECT_DIR"
-          echo "Project name: $PROJECT_NAME"
-          echo "Workspace: $WORKSPACE"
-          
-          # Verify workspace exists
-          if [ ! -d "ios/$WORKSPACE" ]; then
-            echo "ERROR: Workspace ios/$WORKSPACE does not exist!"
-            ls -la ios/
-            exit 1
-          fi
-          
-          xcodebuild -workspace "ios/$WORKSPACE" \
-            -scheme "$PROJECT_NAME" \
-            -sdk iphoneos \
-            -configuration Release \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            -derivedDataPath build
-          
-          mkdir -p Payload
-          cp -r build/Build/Products/Release-iphoneos/${PROJECT_NAME}.app Payload/
-          zip -r coze-app-ios-unsigned.ipa Payload
+          echo "Polling timed out or completed."
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: coze-app-ios-unsigned
-          path: coze-app-ios-unsigned.ipa
-          retention-days: 30
+          name: coze-app-ios-ipa
+          path: "*.ipa"
           if-no-files-found: warn
+          retention-days: 30
