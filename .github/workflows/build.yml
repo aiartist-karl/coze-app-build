@@ -79,8 +79,14 @@ jobs:
 
       - name: Build Unsigned IPA
         run: |
-          xcodebuild -workspace ios/cozeappv2.xcworkspace \
-            -scheme cozeappv2 \
+          # Find the correct project name
+          PROJECT_NAME=$(ls ios/*.xcodeproj | head -1 | sed 's/ios\///' | sed 's/.xcodeproj//')
+          WORKSPACE="${PROJECT_NAME}.xcworkspace"
+          
+          echo "Building with project: $PROJECT_NAME"
+          
+          xcodebuild -workspace "ios/$WORKSPACE" \
+            -scheme "$PROJECT_NAME" \
             -sdk iphoneos \
             -configuration Release \
             CODE_SIGN_IDENTITY="" \
@@ -89,7 +95,7 @@ jobs:
             -derivedDataPath build
 
           mkdir -p Payload
-          cp -r build/Build/Products/Release-iphoneos/cozeappv2.app Payload/
+          cp -r build/Build/Products/Release-iphoneos/${PROJECT_NAME}.app Payload/
           zip -r coze-app-ios-unsigned.ipa Payload
 
       - name: Upload IPA
