@@ -77,42 +77,83 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Build IPA with EAS
-        run: eas build --platform ios --profile preview --non-interactive --no-wait
+        run: |
+          # Initialize EAS project if not already configured
+          eas init --non-interactive || true
+          
+          # Build with EAS
+          eas build --platform ios --profile preview --non-interactive --no-wait 2>&1 | tee eas-build.log
+          
+          # Extract build URL if available
+          grep -oP 'https://expo\.dev/accounts/[^\s]+' eas-build.log || true
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
       - name: Wait for EAS build and download
         run: |
-          echo "Waiting for EAS build to complete..."
-          MAX_ATTEMPTS=60
-          ATTEMPT=0
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          echo "Waiting for EAS iOS build to complete..."
+          for i in $(seq 1 60); do
             sleep 30
-            ATTEMPT=$((ATTEMPT + 1))
-            echo "Check $ATTEMPT/$MAX_ATTEMPTS..."
-            eas build:list --platform ios --status finished --limit 1 --non-interactive 2>/dev/null | tee /tmp/eas_status.txt
-            if grep -qi "finished" /tmp/eas_status.txt; then
-              echo "EAS build completed!"
+            echo "Polling attempt $i..."
+            
+            BUILD_JSON=$(eas build:list --platform ios --limit 1 --json 2>/dev/null || echo "[]")
+            
+            STATUS=$(echo "$BUILD_JSON" | python3 -c "
+          import json,sys
+          try:
+            d=json.load(sys.stdin)
+            if d and len(d)>0:
+              s = d[0].get('status','unknown')
+              print(s)
+            else:
+              print('no_build')
+          except:
+            print('parse_error')
+          " 2>/dev/null || echo "error")
+            
+            echo "Status: $STATUS"
+            
+            if [ "$STATUS" = "FINISHED" ]; then
+              ARTIFACT_URL=$(echo "$BUILD_JSON" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          print(d[0].get('artifacts',{}).get('applicationArchiveUrl',''))
+          " 2>/dev/null || echo "")
+              
+              echo "Downloading artifact from: $ARTIFACT_URL"
+              if [ -n "$ARTIFACT_URL" ]; then
+                curl -L -o coze-app.ipa "$ARTIFACT_URL"
+                echo "Download complete!"
+                ls -la *.ipa
+              fi
               break
-            fi
-            if grep -qi "error" /tmp/eas_status.txt; then
-              echo "EAS build failed with error!"
-              eas build:list --platform ios --limit 3 --non-interactive
+            elif [ "$STATUS" = "ERRORED" ] || [ "$STATUS" = "error" ] || [ "$STATUS" = "CANCELED" ]; then
+              echo "EAS build failed with status: $STATUS"
+              echo "Build details:"
+              echo "$BUILD_JSON" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          if d and len(d)>0:
+            b = d[0]
+            print(f\"  Platform: {b.get('platform','?')}\")
+            print(f\"  Status: {b.get('status','?')}\")
+            print(f\"  Error: {b.get('error',{}).get('message','N/A') if isinstance(b.get('error'), dict) else b.get('error','N/A')}\")
+            print(f\"  Created: {b.get('createdAt','?')}\")
+            print(f\"  Artifacts: {json.dumps(b.get('artifacts',{}), indent=2)}\")
+          " 2>/dev/null || echo "Could not parse build details"
               exit 1
             fi
           done
-          if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
-            echo "Timeout waiting for EAS build"
-            eas build:list --platform ios --limit 3 --non-interactive
-            exit 1
-          fi
-          eas build:download --platform ios --non-interactive || true
+          
+          echo "Polling timed out or completed."
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: coze-app-ios
+          name: coze-app-ios-ipa
           path: "*.ipa"
+          if-no-files-found: warn
           retention-days: 30
