@@ -32,6 +32,19 @@ jobs:
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
+      - name: Fix Kotlin version compatibility
+        run: |
+          # Fix Compose Compiler / Kotlin version mismatch
+          # Compose Compiler 1.5.15 requires Kotlin 1.9.25
+          cd android
+          if grep -q "kotlinVersion" build.gradle; then
+            sed -i "s/kotlinVersion = .*/kotlinVersion = '1.9.25'/" build.gradle
+          else
+            sed -i "/ext {/a\\        kotlinVersion = '1.9.25'" build.gradle
+          fi
+          echo "Kotlin version patched to 1.9.25"
+          grep -i "kotlin" build.gradle | head -5
+
       - name: Install Android deps
         run: |
           cd android
