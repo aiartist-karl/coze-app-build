@@ -25,31 +25,38 @@ jobs:
           token: ${{ secrets.EXPO_TOKEN }}
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci --ignore-scripts
 
       - name: Expo Prebuild (Android)
-        run: npx expo prebuild --platform android --no-install
+        run: npx expo prebuild --platform android
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
-      - name: Install missing deps after prebuild
-        run: npm install expo-asset
+      - name: Install Android deps
+        run: |
+          cd android
+          ./gradlew --version
 
-      - name: Build APK with Gradle
+      - name: Build APK
         run: |
           cd android
           ./gradlew assembleRelease
+        env:
+          EXPO_PUBLIC_SUPABASE_URL: ${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}
+          EXPO_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}
+          EXPO_PUBLIC_OPENAI_API_KEY: ${{ secrets.EXPO_PUBLIC_OPENAI_API_KEY }}
+          EXPO_PUBLIC_ELEVENLABS_API_KEY: ${{ secrets.EXPO_PUBLIC_ELEVENLABS_API_KEY }}
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: coze-app-android
-          path: "android/app/build/outputs/apk/release/*.apk"
+          path: android/app/build/outputs/apk/release/*.apk
           retention-days: 30
-          if-no-files-found: warn
 
   build-ios:
-    name: Build iOS IPA
-    runs-on: macos-14
+    name: Build iOS IPA (EAS)
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -59,60 +66,53 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Setup Expo and EAS
+        uses: expo/expo-github-action@v8
+        with:
+          expo-version: latest
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
       - name: Install dependencies
-        run: npm install
+        run: npm ci --ignore-scripts
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+      - name: Build IPA with EAS
+        run: eas build --platform ios --profile preview --non-interactive --no-wait
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
-      - name: Install CocoaPods
-        run: sudo gem install cocoapods
-
-      - name: Prebuild Expo (iOS)
-        run: npx expo prebuild --platform ios
-
-      - name: Install Pods
+      - name: Wait for EAS build and download
         run: |
-          cd ios
-          pod install
-          cd ..
-
-      - name: Build Unsigned IPA
-        run: |
-          # Fix: use find to correctly detect .xcodeproj directory
-          PROJECT_DIR=$(find ios -maxdepth 1 -name "*.xcodeproj" -type d | head -1)
-          PROJECT_NAME=$(basename "$PROJECT_DIR" .xcodeproj)
-          WORKSPACE="${PROJECT_NAME}.xcworkspace"
-          
-          echo "Project dir: $PROJECT_DIR"
-          echo "Project name: $PROJECT_NAME"
-          echo "Workspace: $WORKSPACE"
-          
-          # Verify workspace exists
-          if [ ! -d "ios/$WORKSPACE" ]; then
-            echo "ERROR: Workspace ios/$WORKSPACE does not exist!"
-            ls -la ios/
+          echo "Waiting for EAS build to complete..."
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            sleep 30
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Check $ATTEMPT/$MAX_ATTEMPTS..."
+            eas build:list --platform ios --status finished --limit 1 --non-interactive 2>/dev/null | tee /tmp/eas_status.txt
+            if grep -qi "finished" /tmp/eas_status.txt; then
+              echo "EAS build completed!"
+              break
+            fi
+            if grep -qi "error" /tmp/eas_status.txt; then
+              echo "EAS build failed with error!"
+              eas build:list --platform ios --limit 3 --non-interactive
+              exit 1
+            fi
+          done
+          if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
+            echo "Timeout waiting for EAS build"
+            eas build:list --platform ios --limit 3 --non-interactive
             exit 1
           fi
-          
-          xcodebuild -workspace "ios/$WORKSPACE" \
-            -scheme "$PROJECT_NAME" \
-            -sdk iphoneos \
-            -configuration Release \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            -derivedDataPath build
-          
-          mkdir -p Payload
-          cp -r build/Build/Products/Release-iphoneos/${PROJECT_NAME}.app Payload/
-          zip -r coze-app-ios-unsigned.ipa Payload
+          eas build:download --platform ios --non-interactive || true
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: coze-app-ios-unsigned
-          path: coze-app-ios-unsigned.ipa
+          name: coze-app-ios
+          path: "*.ipa"
           retention-days: 30
-          if-no-files-found: warn
