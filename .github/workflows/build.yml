@@ -29,39 +29,47 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build APK with EAS
-        run: eas build --platform android --profile preview --non-interactive --no-wait 2>&1 | tee eas-build.log
+      - name: Initialize EAS project
+        run: eas init --id $(cat app.json | python3 -c "import json,sys; print(json.load(sys.stdin).get('extra',{}).get('eas',{}).get('projectId',''))" 2>/dev/null || echo "") --non-interactive 2>/dev/null || eas init --non-interactive 2>&1 || true
 
-      - name: Wait and get build URL
+      - name: Build APK with EAS
+        run: |
+          # First try eas init to link the project
+          eas init --non-interactive 2>&1 || true
+          # Then build
+          eas build --platform android --profile preview --non-interactive 2>&1 | tee eas-build.log
+
+      - name: Wait for build and download artifact
         run: |
           # Extract build URL from EAS output
-          BUILD_URL=$(grep -oP 'https://expo.dev/accounts/[^ ]+/builds/[^ ]+' eas-build.log | head -1 || echo "")
-          if [ -z "$BUILD_URL" ]; then
-            echo "Trying to get build from eas build:list..."
-            sleep 5
-            BUILD_INFO=$(eas build:list --platform android --limit 1 --json 2>/dev/null || echo "[]")
-            echo "$BUILD_INFO" > build-info.json
-            BUILD_URL=$(echo "$BUILD_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['artifacts']['buildUrl'] if d and d[0].get('artifacts') and d[0]['artifacts'].get('buildUrl') else '')" 2>/dev/null || echo "")
-          fi
-          echo "BUILD_URL=$BUILD_URL" >> $GITHUB_ENV
+          BUILD_URL=$(grep -oP 'https://expo.dev/[^ ]+' eas-build.log | head -1 || echo "")
           echo "Build URL: $BUILD_URL"
-
-      - name: Wait for build completion and download
-        run: |
+          
           if [ -z "$BUILD_URL" ]; then
-            echo "No build URL found, trying alternative approach..."
-            # Poll eas build:list until build is finished
+            # Poll for the latest build
             for i in $(seq 1 60); do
               sleep 30
               echo "Polling build status... attempt $i"
               BUILD_INFO=$(eas build:list --platform android --limit 1 --json 2>/dev/null || echo "[]")
-              STATUS=$(echo "$BUILD_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['status'] if d else 'unknown')" 2>/dev/null || echo "unknown")
+              STATUS=$(echo "$BUILD_INFO" | python3 -c "
+          import json,sys
+          try:
+            d=json.load(sys.stdin)
+            if d and len(d)>0:
+              print(d[0].get('status','unknown'))
+            else:
+              print('no_build')
+          except: print('error')
+          " 2>/dev/null)
               echo "Build status: $STATUS"
               if [ "$STATUS" = "FINISHED" ]; then
-                ARTIFACT_URL=$(echo "$BUILD_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['artifacts']['applicationArchiveUrl'] if d[0].get('artifacts') and d[0]['artifacts'].get('applicationArchiveUrl') else '')" 2>/dev/null || echo "")
+                ARTIFACT_URL=$(echo "$BUILD_INFO" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          print(d[0].get('artifacts',{}).get('applicationArchiveUrl',''))
+          " 2>/dev/null)
                 echo "Downloading from: $ARTIFACT_URL"
                 curl -L -o coze-app.apk "$ARTIFACT_URL"
-                echo "Download complete!"
                 break
               elif [ "$STATUS" = "ERRORED" ] || [ "$STATUS" = "CANCELED" ]; then
                 echo "Build failed with status: $STATUS"
@@ -102,22 +110,37 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build IPA with EAS
-        run: eas build --platform ios --profile preview --non-interactive --no-wait 2>&1 | tee eas-build.log
+      - name: Initialize EAS project
+        run: eas init --non-interactive 2>&1 || true
 
-      - name: Wait for build completion and download
+      - name: Build IPA with EAS
+        run: eas build --platform ios --profile preview --non-interactive 2>&1 | tee eas-build.log
+
+      - name: Wait for build and download artifact
         run: |
           for i in $(seq 1 60); do
             sleep 30
             echo "Polling iOS build status... attempt $i"
             BUILD_INFO=$(eas build:list --platform ios --limit 1 --json 2>/dev/null || echo "[]")
-            STATUS=$(echo "$BUILD_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['status'] if d else 'unknown')" 2>/dev/null || echo "unknown")
+            STATUS=$(echo "$BUILD_INFO" | python3 -c "
+          import json,sys
+          try:
+            d=json.load(sys.stdin)
+            if d and len(d)>0:
+              print(d[0].get('status','unknown'))
+            else:
+              print('no_build')
+          except: print('error')
+          " 2>/dev/null)
             echo "Build status: $STATUS"
             if [ "$STATUS" = "FINISHED" ]; then
-              ARTIFACT_URL=$(echo "$BUILD_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['artifacts']['applicationArchiveUrl'] if d[0].get('artifacts') and d[0]['artifacts'].get('applicationArchiveUrl') else '')" 2>/dev/null || echo "")
+              ARTIFACT_URL=$(echo "$BUILD_INFO" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          print(d[0].get('artifacts',{}).get('applicationArchiveUrl',''))
+          " 2>/dev/null)
               echo "Downloading from: $ARTIFACT_URL"
               curl -L -o coze-app.ipa "$ARTIFACT_URL"
-              echo "Download complete!"
               break
             elif [ "$STATUS" = "ERRORED" ] || [ "$STATUS" = "CANCELED" ]; then
               echo "Build failed with status: $STATUS"
