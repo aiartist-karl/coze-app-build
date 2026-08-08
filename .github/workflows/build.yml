@@ -17,43 +17,39 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
       - name: Setup Expo
         uses: expo/expo-github-action@v8
         with:
           expo-version: latest
+          eas-version: latest
           token: ${{ secrets.EXPO_TOKEN }}
 
       - name: Install dependencies
-        run: npm ci --ignore-scripts
+        run: npm ci
 
-      - name: Expo Prebuild (Android)
-        run: npx expo prebuild --platform android --no-install
+      - name: Build APK with EAS
+        run: eas build --platform android --profile preview --non-interactive --no-wait
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
-      - name: Install Android deps
+      - name: Wait for build and download artifact
         run: |
-          cd android
-          # Fix any gradle issues
-          sed -i 's/def FALLBACK_VERSION = "1.6.0"/def FALLBACK_VERSION = "1.6.0"/' settings.gradle 2>/dev/null || true
+          sleep 300
+          eas build:download --platform android --non-interactive || true
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
-      - name: Build APK
-        run: |
-          cd android
-          chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon
-
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: coze-app-android-apk
-          path: android/app/build/outputs/apk/release/*.apk
-          if-no-files-found: warn
+          name: coze-app-android
+          path: "*.apk"
           retention-days: 30
 
   build-ios:
-    name: Build iOS IPA (EAS)
-    runs-on: ubuntu-latest
+    name: Build iOS IPA
+    runs-on: macos-14
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -62,90 +58,43 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-
-      - name: Setup Expo and EAS
-        uses: expo/expo-github-action@v8
-        with:
-          expo-version: latest
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
 
       - name: Install dependencies
-        run: npm ci --ignore-scripts
+        run: npm ci
 
-      - name: Build IPA with EAS
-        run: |
-          eas build --platform ios --profile preview --non-interactive --no-wait 2>&1 | tee eas-build.log
-          
-          # Extract build page URL
-          BUILD_PAGE_URL=$(grep -oP 'https://expo\.dev/accounts/[^\s]+' eas-build.log | head -1 || echo "")
-          echo "Build page URL: $BUILD_PAGE_URL"
-          echo "BUILD_PAGE_URL=$BUILD_PAGE_URL" >> $GITHUB_ENV
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
 
-      - name: Wait for EAS build and download
+      - name: Install CocoaPods
+        run: sudo gem install cocoapods
+
+      - name: Prebuild Expo
+        run: npx expo prebuild --platform ios
+
+      - name: Install Pods
         run: |
-          echo "Waiting for EAS iOS build to complete..."
-          for i in $(seq 1 60); do
-            sleep 30
-            echo "Polling attempt $i..."
-            
-            BUILD_JSON=$(eas build:list --platform ios --limit 1 --json 2>/dev/null || echo "[]")
-            
-            STATUS=$(echo "$BUILD_JSON" | python3 -c "
-          import json,sys
-          try:
-            d=json.load(sys.stdin)
-            if d and len(d)>0:
-              s = d[0].get('status','unknown')
-              print(s)
-            else:
-              print('no_build')
-          except:
-            print('parse_error')
-          " 2>/dev/null || echo "error")
-            
-            echo "Status: $STATUS"
-            
-            if [ "$STATUS" = "FINISHED" ]; then
-              ARTIFACT_URL=$(echo "$BUILD_JSON" | python3 -c "
-          import json,sys
-          d=json.load(sys.stdin)
-          print(d[0].get('artifacts',{}).get('applicationArchiveUrl',''))
-          " 2>/dev/null || echo "")
-              
-              echo "Downloading artifact from: $ARTIFACT_URL"
-              if [ -n "$ARTIFACT_URL" ]; then
-                curl -L -o coze-app.ipa "$ARTIFACT_URL"
-                echo "Download complete!"
-                ls -la coze-app.ipa
-              fi
-              break
-            elif [ "$STATUS" = "ERRORED" ] || [ "$STATUS" = "error" ] || [ "$STATUS" = "CANCELED" ]; then
-              echo "EAS build failed with status: $STATUS"
-              echo "Build details:"
-              echo "$BUILD_JSON" | python3 -c "
-          import json,sys
-          d=json.load(sys.stdin)
-          if d and len(d)>0:
-            b = d[0]
-            print(f\"  Platform: {b.get('platform','?')}\")
-            print(f\"  Status: {b.get('status','?')}\")
-            print(f\"  Error: {b.get('error',{}).get('message','N/A') if isinstance(b.get('error'), dict) else b.get('error','N/A')}\")
-            print(f\"  Created: {b.get('createdAt','?')}\")
-            print(f\"  Artifacts: {json.dumps(b.get('artifacts',{}), indent=2)}\")
-          " 2>/dev/null || echo "Could not parse build details"
-              exit 1
-            fi
-          done
-          
-          echo "Polling timed out or completed."
+          cd ios
+          pod install
+          cd ..
+
+      - name: Build Unsigned IPA
+        run: |
+          xcodebuild -workspace ios/cozeappv2.xcworkspace \
+            -scheme cozeappv2 \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath build
+
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/cozeappv2.app Payload/
+          zip -r coze-app-ios-unsigned.ipa Payload
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: coze-app-ios-ipa
-          path: "*.ipa"
-          if-no-files-found: warn
+          name: coze-app-ios-unsigned
+          path: coze-app-ios-unsigned.ipa
           retention-days: 30
