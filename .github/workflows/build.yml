@@ -30,11 +30,58 @@ jobs:
         run: npm ci
 
       - name: Build APK with EAS
-        run: eas build --platform android --profile preview --non-interactive --no-wait
+        run: eas build --platform android --profile preview --non-interactive --no-wait 2>&1 | tee eas-build.log
+
+      - name: Wait and get build URL
+        run: |
+          # Extract build URL from EAS output
+          BUILD_URL=$(grep -oP 'https://expo.dev/accounts/[^ ]+/builds/[^ ]+' eas-build.log | head -1 || echo "")
+          if [ -z "$BUILD_URL" ]; then
+            echo "Trying to get build from eas build:list..."
+            sleep 5
+            BUILD_INFO=$(eas build:list --platform android --limit 1 --json 2>/dev/null || echo "[]")
+            echo "$BUILD_INFO" > build-info.json
+            BUILD_URL=$(echo "$BUILD_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['artifacts']['buildUrl'] if d and d[0].get('artifacts') and d[0]['artifacts'].get('buildUrl') else '')" 2>/dev/null || echo "")
+          fi
+          echo "BUILD_URL=$BUILD_URL" >> $GITHUB_ENV
+          echo "Build URL: $BUILD_URL"
+
+      - name: Wait for build completion and download
+        run: |
+          if [ -z "$BUILD_URL" ]; then
+            echo "No build URL found, trying alternative approach..."
+            # Poll eas build:list until build is finished
+            for i in $(seq 1 60); do
+              sleep 30
+              echo "Polling build status... attempt $i"
+              BUILD_INFO=$(eas build:list --platform android --limit 1 --json 2>/dev/null || echo "[]")
+              STATUS=$(echo "$BUILD_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['status'] if d else 'unknown')" 2>/dev/null || echo "unknown")
+              echo "Build status: $STATUS"
+              if [ "$STATUS" = "FINISHED" ]; then
+                ARTIFACT_URL=$(echo "$BUILD_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['artifacts']['applicationArchiveUrl'] if d[0].get('artifacts') and d[0]['artifacts'].get('applicationArchiveUrl') else '')" 2>/dev/null || echo "")
+                echo "Downloading from: $ARTIFACT_URL"
+                curl -L -o coze-app.apk "$ARTIFACT_URL"
+                echo "Download complete!"
+                break
+              elif [ "$STATUS" = "ERRORED" ] || [ "$STATUS" = "CANCELED" ]; then
+                echo "Build failed with status: $STATUS"
+                exit 1
+              fi
+            done
+          fi
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coze-app-android-apk
+          path: "*.apk"
+          if-no-files-found: warn
+          retention-days: 30
 
   build-ios:
     name: Build iOS IPA
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -56,4 +103,33 @@ jobs:
         run: npm ci
 
       - name: Build IPA with EAS
-        run: eas build --platform ios --profile preview --non-interactive --no-wait
+        run: eas build --platform ios --profile preview --non-interactive --no-wait 2>&1 | tee eas-build.log
+
+      - name: Wait for build completion and download
+        run: |
+          for i in $(seq 1 60); do
+            sleep 30
+            echo "Polling iOS build status... attempt $i"
+            BUILD_INFO=$(eas build:list --platform ios --limit 1 --json 2>/dev/null || echo "[]")
+            STATUS=$(echo "$BUILD_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['status'] if d else 'unknown')" 2>/dev/null || echo "unknown")
+            echo "Build status: $STATUS"
+            if [ "$STATUS" = "FINISHED" ]; then
+              ARTIFACT_URL=$(echo "$BUILD_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['artifacts']['applicationArchiveUrl'] if d[0].get('artifacts') and d[0]['artifacts'].get('applicationArchiveUrl') else '')" 2>/dev/null || echo "")
+              echo "Downloading from: $ARTIFACT_URL"
+              curl -L -o coze-app.ipa "$ARTIFACT_URL"
+              echo "Download complete!"
+              break
+            elif [ "$STATUS" = "ERRORED" ] || [ "$STATUS" = "CANCELED" ]; then
+              echo "Build failed with status: $STATUS"
+              exit 1
+            fi
+          done
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coze-app-ios-ipa
+          path: "*.ipa"
+          if-no-files-found: warn
+          retention-days: 30
